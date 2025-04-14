@@ -1,4 +1,3 @@
-// pages/watchlist.tsx
 import React, { useState, useEffect } from 'react';
 import LogoImage from '~/core/ui/Logo/LogoImage';
 import { FaFlag, FaSave, FaTag, FaTrash } from 'react-icons/fa';
@@ -9,28 +8,23 @@ interface WatchlistSymbol {
   symbol: string;
   percentChange: string;
   lastPrice: string;
-
   // Press Release
   pressName: string;
   pressAccount: string;
   pressDateTime: string;
   pressHeadline: string;
-
   // Tweets
   tweetName: string;
   tweetAccount: string;
   tweetDateTime: string;
   tweetContent: string;
-
   // Trade Exchange
   tradeDateTime: string;
   tradeMessage: string;
-
   // Filings
   filingsDateTime: string;
   filingsForm: string;
   filingsNotes: string;
-
   // Additional flags
   flag: boolean;
   save: boolean;
@@ -55,10 +49,25 @@ interface BottomPressRelease {
   tag: boolean;
 }
 
+/**
+ * Returns a singleton instance of our SharedWorker.
+ * This caches the worker on the window object.
+ */
+function getSharedWorker(): SharedWorker {
+  if (!(window as any).__sharedWorkerInstance) {
+    console.log('[WatchlistPage] Creating new SharedWorker instance.');
+    (window as any).__sharedWorkerInstance = new SharedWorker('/shared-worker.js');
+    (window as any).__sharedWorkerInstance.port.start();
+  } else {
+    console.log('[WatchlistPage] Reusing existing SharedWorker instance.');
+  }
+  return (window as any).__sharedWorkerInstance;
+}
+
 export default function WatchlistPage() {
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
 
-  // Master list of watchlists
+  // Example watchlists.
   const [watchlists, setWatchlists] = useState<Watchlist[]>([
     {
       name: 'Watchlist 1',
@@ -137,14 +146,13 @@ export default function WatchlistPage() {
       ],
     },
   ]);
+
   const [selectedWatchlistIndex, setSelectedWatchlistIndex] = useState(0);
   const [newWatchlistName, setNewWatchlistName] = useState('');
   const [newSymbolText, setNewSymbolText] = useState('');
-
-  // Track which symbol is selected
+  // Track which symbol is selected—auto-select on mount or if none is selected.
   const [selectedSymbolId, setSelectedSymbolId] = useState<number | null>(null);
-
-  // "Press Release Template" at the bottom
+  // Bottom press release section.
   const [bottomPressReleases, setBottomPressReleases] = useState<BottomPressRelease[]>([
     {
       id: 1,
@@ -168,21 +176,99 @@ export default function WatchlistPage() {
     },
   ]);
 
+  // Set theme on mount.
   useEffect(() => {
     const darkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
     setTheme(darkMode ? 'dark' : 'light');
+    console.log('[WatchlistPage] Theme set to:', darkMode ? 'dark' : 'light');
   }, []);
 
   const currentWatchlist = watchlists[selectedWatchlistIndex];
 
-  // Auto-select first symbol if available when watchlist changes
+  // Auto-select first symbol only if none is selected.
   useEffect(() => {
-    if (currentWatchlist && currentWatchlist.symbols.length > 0) {
+    if (currentWatchlist && currentWatchlist.symbols.length > 0 && selectedSymbolId === null) {
       setSelectedSymbolId(currentWatchlist.symbols[0].id);
-    } else {
-      setSelectedSymbolId(null);
+      console.log('[WatchlistPage] Auto-selected first symbol:', currentWatchlist.symbols[0].symbol);
     }
-  }, [selectedWatchlistIndex, currentWatchlist]);
+  }, [selectedWatchlistIndex, currentWatchlist, selectedSymbolId]);
+
+  /***************************************************
+   * Worker Connection (Mount Only)
+   ***************************************************/
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const worker = getSharedWorker();
+      console.log('[WatchlistPage] Setting up worker onmessage handler.');
+      worker.port.onmessage = (event) => {
+        console.log('[WatchlistPage] Message from SharedWorker:', event.data);
+        if (event.data.type === 'quote' && event.data.symbol) {
+          setWatchlists(prev => {
+            // Update every watchlist that contains this symbol.
+            const newState = prev.map(wl => {
+              if (wl.symbols.some(sym => sym.symbol === event.data.symbol)) {
+                const updatedSymbols = wl.symbols.map(sym => {
+                  if (sym.symbol === event.data.symbol) {
+                    console.log('[WatchlistPage] Updating quote for:', event.data.symbol, event.data.payload);
+                    return {
+                      ...sym,
+                      lastPrice: event.data.payload?.l ? event.data.payload.l.toString() : sym.lastPrice,
+                      percentChange: event.data.payload?.pc ? event.data.payload.pc.toString() : sym.percentChange,
+                    };
+                  }
+                  return sym;
+                });
+                return { ...wl, symbols: updatedSymbols };
+              }
+              return wl;
+            });
+            console.log('[WatchlistPage] Updated watchlists state:', newState);
+            return newState;
+          });
+        }
+      };
+
+      console.log('[WatchlistPage] Sending connect message to shared worker.');
+      worker.port.postMessage({
+        type: 'connect',
+        apiKey: process.env.NEXT_PUBLIC_POLYGON_API_KEY,
+      });
+    }
+  }, []); // Runs once on mount
+
+  /***************************************************
+   * Subscribe to Symbols When Current Watchlist Changes
+   ***************************************************/
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const worker = getSharedWorker();
+      const uniqueSymbols = Array.from(new Set(currentWatchlist.symbols.map(s => s.symbol)));
+      console.log('[WatchlistPage] Subscribing to symbols:', uniqueSymbols);
+      uniqueSymbols.forEach(symbol => {
+        worker.port.postMessage({ type: 'subscribe', symbol });
+      });
+    }
+  }, [currentWatchlist]);
+
+  /***************************************************
+   * Poll for Missing Prices Every 30 Seconds
+   ***************************************************/
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      // Find symbols in the current watchlist with lastPrice "0.00" (i.e. missing updates)
+      const missingSymbols = currentWatchlist.symbols
+        .filter(sym => sym.lastPrice === '0.00')
+        .map(sym => sym.symbol);
+      if (missingSymbols.length > 0) {
+        console.log('[WatchlistPage] Polling: Re-subscribing to missing symbols:', missingSymbols);
+        const worker = getSharedWorker();
+        missingSymbols.forEach(symbol => {
+          worker.port.postMessage({ type: 'subscribe', symbol });
+        });
+      }
+    }, 30000); // every 30 seconds
+    return () => clearInterval(intervalId);
+  }, [currentWatchlist]);
 
   /***************************************************
    * WATCHLIST ACTIONS
@@ -191,19 +277,19 @@ export default function WatchlistPage() {
     const trimmed = newWatchlistName.trim();
     if (!trimmed) return;
     const newWL: Watchlist = { name: trimmed, symbols: [] };
-    setWatchlists((prev) => [...prev, newWL]);
+    setWatchlists(prev => [...prev, newWL]);
     setSelectedWatchlistIndex(watchlists.length);
     setNewWatchlistName('');
     setSelectedSymbolId(null);
+    console.log('[WatchlistPage] Added new watchlist:', trimmed);
   };
 
   const handleDeleteWatchlist = () => {
     if (watchlists.length === 1) return;
-    setWatchlists((prev) =>
-      prev.filter((_, i) => i !== selectedWatchlistIndex)
-    );
+    setWatchlists(prev => prev.filter((_, i) => i !== selectedWatchlistIndex));
     setSelectedWatchlistIndex(0);
     setSelectedSymbolId(null);
+    console.log('[WatchlistPage] Deleted watchlist at index:', selectedWatchlistIndex);
   };
 
   /***************************************************
@@ -236,33 +322,32 @@ export default function WatchlistPage() {
       save: false,
       tag: false,
     };
-    const updatedWL = {
+    const updatedWL: Watchlist = {
       ...currentWatchlist,
       symbols: [...currentWatchlist.symbols, newSymbol],
     };
-    setWatchlists((prev) =>
+    setWatchlists(prev =>
       prev.map((wl, i) => (i === selectedWatchlistIndex ? updatedWL : wl))
     );
-    setNewSymbolText('');
     setSelectedSymbolId(newId);
+    console.log('[WatchlistPage] Added new symbol:', newSymbol.symbol);
+
+    const worker = getSharedWorker();
+    console.log('[WatchlistPage] Subscribing to new symbol:', newSymbol.symbol);
+    worker.port.postMessage({ type: 'subscribe', symbol: newSymbol.symbol });
   };
 
   const handleDeleteSymbol = (symbolId: number) => {
     if (!currentWatchlist) return;
-    const updatedSymbols = currentWatchlist.symbols.filter(
-      (s) => s.id !== symbolId
-    );
+    const updatedSymbols = currentWatchlist.symbols.filter(s => s.id !== symbolId);
     const updatedWL = { ...currentWatchlist, symbols: updatedSymbols };
-    setWatchlists((prev) =>
+    setWatchlists(prev =>
       prev.map((wl, i) => (i === selectedWatchlistIndex ? updatedWL : wl))
     );
     if (symbolId === selectedSymbolId) {
-      if (updatedSymbols.length > 0) {
-        setSelectedSymbolId(updatedSymbols[0].id);
-      } else {
-        setSelectedSymbolId(null);
-      }
+      setSelectedSymbolId(updatedSymbols.length > 0 ? updatedSymbols[0].id : null);
     }
+    console.log('[WatchlistPage] Deleted symbol with id:', symbolId);
   };
 
   const toggleSymbolField = (
@@ -270,13 +355,14 @@ export default function WatchlistPage() {
     field: keyof Pick<WatchlistSymbol, 'flag' | 'save' | 'tag'>
   ) => {
     if (!currentWatchlist) return;
-    const updatedSymbols = currentWatchlist.symbols.map((sym) =>
+    const updatedSymbols = currentWatchlist.symbols.map(sym =>
       sym.id === symbolId ? { ...sym, [field]: !sym[field] } : sym
     );
     const updatedWL = { ...currentWatchlist, symbols: updatedSymbols };
-    setWatchlists((prev) =>
+    setWatchlists(prev =>
       prev.map((wl, i) => (i === selectedWatchlistIndex ? updatedWL : wl))
     );
+    console.log('[WatchlistPage] Toggled field', field, 'for symbol id:', symbolId);
   };
 
   const updateSymbolField = (
@@ -285,17 +371,17 @@ export default function WatchlistPage() {
     newValue: string
   ) => {
     if (!currentWatchlist) return;
-    const updatedSymbols = currentWatchlist.symbols.map((sym) =>
+    const updatedSymbols = currentWatchlist.symbols.map(sym =>
       sym.id === symbolId ? { ...sym, [field]: newValue } : sym
     );
     const updatedWL = { ...currentWatchlist, symbols: updatedSymbols };
-    setWatchlists((prev) =>
+    setWatchlists(prev =>
       prev.map((wl, i) => (i === selectedWatchlistIndex ? updatedWL : wl))
     );
+    console.log('[WatchlistPage] Updated field', field, 'for symbol id:', symbolId, 'to:', newValue);
   };
 
-  const selectedSymbol =
-    currentWatchlist?.symbols.find((s) => s.id === selectedSymbolId) || null;
+  const selectedSymbol = currentWatchlist?.symbols.find(s => s.id === selectedSymbolId) || null;
 
   /***************************************************
    * BOTTOM PRESS RELEASES ACTIONS
@@ -304,47 +390,30 @@ export default function WatchlistPage() {
     id: number,
     field: keyof Pick<BottomPressRelease, 'flag' | 'save' | 'tag'>
   ) => {
-    setBottomPressReleases((prev) =>
-      prev.map((item) =>
-        item.id === id ? { ...item, [field]: !item[field] } : item
-      )
+    setBottomPressReleases(prev =>
+      prev.map(item => (item.id === id ? { ...item, [field]: !item[field] } : item))
     );
+    console.log('[WatchlistPage] Toggled Bottom PR field', field, 'for id:', id);
   };
 
   const handleDeleteBottomPR = (id: number) => {
-    setBottomPressReleases((prev) => prev.filter((item) => item.id !== id));
+    setBottomPressReleases(prev => prev.filter(item => item.id !== id));
+    console.log('[WatchlistPage] Deleted Bottom PR with id:', id);
   };
 
   if (!currentWatchlist) {
     return (
-      <div
-        className={`flex items-center justify-center min-h-screen ${
-          theme === 'dark'
-            ? 'bg-gray-900 text-white'
-            : 'bg-gray-100 text-gray-800'
-        }`}
-      >
+      <div className={`flex items-center justify-center min-h-screen ${theme === 'dark' ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-800'}`}>
         <p>No watchlists available.</p>
       </div>
     );
   }
 
   return (
-    <div
-      className={`relative min-h-screen text-base ${
-        theme === 'dark' ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-800'
-      }`}
-    >
+    <div className={`relative min-h-screen text-base ${theme === 'dark' ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-800'}`}>
       {/* Gradient Background */}
-      <div
-        className={`absolute inset-0 ${
-          theme === 'dark'
-            ? 'bg-gradient-to-br from-gray-800 via-gray-900 to-black'
-            : 'bg-gradient-to-br from-blue-50 via-blue-100 to-purple-200'
-        } z-0`}
-        style={{ backgroundAttachment: 'fixed' }}
-      />
-
+      <div className={`absolute inset-0 ${theme === 'dark' ? 'bg-gradient-to-br from-gray-800 via-gray-900 to-black' : 'bg-gradient-to-br from-blue-50 via-blue-100 to-purple-200'} z-0`} style={{ backgroundAttachment: 'fixed' }} />
+      
       <div className="relative z-10 p-6 max-w-7xl mx-auto space-y-4">
         {/* Centered Logo */}
         <div className="flex justify-center">
@@ -358,12 +427,9 @@ export default function WatchlistPage() {
             value={selectedWatchlistIndex}
             onChange={(e) => {
               setSelectedWatchlistIndex(Number(e.target.value));
+              console.log('[WatchlistPage] Changed selected watchlist index to:', e.target.value);
             }}
-            className={`text-sm px-3 py-2 border rounded-lg ${
-              theme === 'dark'
-                ? 'bg-gray-800 text-white border-gray-600'
-                : 'bg-white text-gray-800 border-gray-300'
-            }`}
+            className={`text-sm px-3 py-2 border rounded-lg ${theme === 'dark' ? 'bg-gray-800 text-white border-gray-600' : 'bg-white text-gray-800 border-gray-300'}`}
           >
             {watchlists.map((wl, index) => (
               <option key={index} value={index}>
@@ -376,23 +442,13 @@ export default function WatchlistPage() {
             placeholder="New watchlist name"
             value={newWatchlistName}
             onChange={(e) => setNewWatchlistName(e.target.value)}
-            className={`text-sm px-3 py-2 border rounded-lg ${
-              theme === 'dark'
-                ? 'bg-gray-800 text-white border-gray-600'
-                : 'bg-white text-gray-800 border-gray-300'
-            }`}
+            className={`text-sm px-3 py-2 border rounded-lg ${theme === 'dark' ? 'bg-gray-800 text-white border-gray-600' : 'bg-white text-gray-800 border-gray-300'}`}
             style={{ width: '180px' }}
           />
-          <button
-            onClick={handleAddWatchlist}
-            className="text-sm px-3 py-2 bg-blue-600 text-white rounded shadow hover:scale-105 transition transform"
-          >
+          <button onClick={handleAddWatchlist} className="text-sm px-3 py-2 bg-blue-600 text-white rounded shadow hover:scale-105 transition transform">
             New
           </button>
-          <button
-            onClick={handleDeleteWatchlist}
-            className="text-sm px-3 py-2 bg-red-600 text-white rounded shadow hover:scale-105 transition transform"
-          >
+          <button onClick={handleDeleteWatchlist} className="text-sm px-3 py-2 bg-red-600 text-white rounded shadow hover:scale-105 transition transform">
             Delete
           </button>
           <div className="flex items-center space-x-2 ml-4">
@@ -401,28 +457,17 @@ export default function WatchlistPage() {
               placeholder="Add Symbol"
               value={newSymbolText}
               onChange={(e) => setNewSymbolText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  handleAddSymbol();
-                }
-              }}
-              className={`text-sm px-3 py-2 border rounded-lg ${
-                theme === 'dark'
-                  ? 'bg-gray-800 text-white border-gray-600'
-                  : 'bg-white text-gray-800 border-gray-300'
-              }`}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleAddSymbol(); }}
+              className={`text-sm px-3 py-2 border rounded-lg ${theme === 'dark' ? 'bg-gray-800 text-white border-gray-600' : 'bg-white text-gray-800 border-gray-300'}`}
               style={{ width: '120px' }}
             />
-            <button
-              onClick={handleAddSymbol}
-              className="text-sm px-3 py-2 bg-green-600 text-white rounded shadow hover:scale-105 transition transform"
-            >
+            <button onClick={handleAddSymbol} className="text-sm px-3 py-2 bg-green-600 text-white rounded shadow hover:scale-105 transition transform">
               Add
             </button>
           </div>
         </div>
 
-        {/* Main Content: left table, right detail panel */}
+        {/* Main Content: Left Table and Right Detail Panel */}
         <div className="grid grid-cols-2 gap-6">
           {/* LEFT: Symbol Table */}
           <div className="bg-opacity-70 rounded-xl shadow-2xl backdrop-blur-lg p-4 overflow-x-auto">
@@ -436,11 +481,14 @@ export default function WatchlistPage() {
                 </tr>
               </thead>
               <tbody>
-                {currentWatchlist.symbols.map((sym) => (
+                {currentWatchlist.symbols.map(sym => (
                   <tr
                     key={sym.id}
                     className="cursor-pointer transition duration-200 hover:bg-gradient-to-r hover:from-blue-500 hover:via-cyan-500 hover:to-purple-500 hover:text-white"
-                    onClick={() => setSelectedSymbolId(sym.id)}
+                    onClick={() => {
+                      setSelectedSymbolId(sym.id);
+                      console.log('[WatchlistPage] Selected symbol:', sym.symbol);
+                    }}
                   >
                     <td className="px-3 py-2 font-medium">{sym.symbol}</td>
                     <td className="px-3 py-2">{sym.percentChange}</td>
@@ -460,106 +508,28 @@ export default function WatchlistPage() {
                   <div className="flex items-center justify-between mb-2">
                     <h3 className="font-semibold text-lg">Press Release</h3>
                     <div className="flex items-center space-x-3">
-                      <FaFlag
-                        size={25}
-                        className="cursor-pointer text-red-500 hover:text-red-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'flag')
-                        }
-                      />
-                      <FaSave
-                        size={25}
-                        className="cursor-pointer text-green-500 hover:text-green-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'save')
-                        }
-                      />
-                      <FaTag
-                        size={25}
-                        className="cursor-pointer text-purple-500 hover:text-purple-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'tag')
-                        }
-                      />
-                      <FaTrash
-                        size={25}
-                        className="cursor-pointer text-red-500 hover:text-red-700"
-                        onClick={() => handleDeleteSymbol(selectedSymbol.id)}
-                      />
+                      <FaFlag size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'flag')} />
+                      <FaSave size={25} className="cursor-pointer text-green-500 hover:text-green-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'save')} />
+                      <FaTag size={25} className="cursor-pointer text-purple-500 hover:text-purple-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'tag')} />
+                      <FaTrash size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => handleDeleteSymbol(selectedSymbol.id)} />
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Name
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="Name"
-                        value={selectedSymbol.pressName}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'pressName',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Name</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Name" value={selectedSymbol.pressName} onChange={e => updateSymbolField(selectedSymbol.id, 'pressName', e.target.value)} />
                     </div>
                     <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Account
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="Account"
-                        value={selectedSymbol.pressAccount}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'pressAccount',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Account</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Account" value={selectedSymbol.pressAccount} onChange={e => updateSymbolField(selectedSymbol.id, 'pressAccount', e.target.value)} />
                     </div>
                     <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Date &amp; Time
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="MM/DD/YYYY HH:MM"
-                        value={selectedSymbol.pressDateTime}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'pressDateTime',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Date &amp; Time</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="MM/DD/YYYY HH:MM" value={selectedSymbol.pressDateTime} onChange={e => updateSymbolField(selectedSymbol.id, 'pressDateTime', e.target.value)} />
                     </div>
                     <div className="col-span-2">
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Headline
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="Headline linked to URL"
-                        value={selectedSymbol.pressHeadline}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'pressHeadline',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Headline</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Headline linked to URL" value={selectedSymbol.pressHeadline} onChange={e => updateSymbolField(selectedSymbol.id, 'pressHeadline', e.target.value)} />
                     </div>
                   </div>
                 </div>
@@ -569,106 +539,28 @@ export default function WatchlistPage() {
                   <div className="flex items-center justify-between mb-2">
                     <h3 className="font-semibold text-lg">Tweets</h3>
                     <div className="flex items-center space-x-3">
-                      <FaFlag
-                        size={25}
-                        className="cursor-pointer text-red-500 hover:text-red-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'flag')
-                        }
-                      />
-                      <FaSave
-                        size={25}
-                        className="cursor-pointer text-green-500 hover:text-green-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'save')
-                        }
-                      />
-                      <FaTag
-                        size={25}
-                        className="cursor-pointer text-purple-500 hover:text-purple-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'tag')
-                        }
-                      />
-                      <FaTrash
-                        size={25}
-                        className="cursor-pointer text-red-500 hover:text-red-700"
-                        onClick={() => handleDeleteSymbol(selectedSymbol.id)}
-                      />
+                      <FaFlag size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'flag')} />
+                      <FaSave size={25} className="cursor-pointer text-green-500 hover:text-green-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'save')} />
+                      <FaTag size={25} className="cursor-pointer text-purple-500 hover:text-purple-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'tag')} />
+                      <FaTrash size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => handleDeleteSymbol(selectedSymbol.id)} />
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Name
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="Name"
-                        value={selectedSymbol.tweetName}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'tweetName',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Name</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Name" value={selectedSymbol.tweetName} onChange={e => updateSymbolField(selectedSymbol.id, 'tweetName', e.target.value)} />
                     </div>
                     <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Account
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="Account"
-                        value={selectedSymbol.tweetAccount}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'tweetAccount',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Account</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Account" value={selectedSymbol.tweetAccount} onChange={e => updateSymbolField(selectedSymbol.id, 'tweetAccount', e.target.value)} />
                     </div>
                     <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Date &amp; Time
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="MM/DD/YYYY HH:MM"
-                        value={selectedSymbol.tweetDateTime}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'tweetDateTime',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Date &amp; Time</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="MM/DD/YYYY HH:MM" value={selectedSymbol.tweetDateTime} onChange={e => updateSymbolField(selectedSymbol.id, 'tweetDateTime', e.target.value)} />
                     </div>
                     <div className="col-span-2">
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Tweet Content
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="Tweet content"
-                        value={selectedSymbol.tweetContent}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'tweetContent',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Tweet Content</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Tweet content" value={selectedSymbol.tweetContent} onChange={e => updateSymbolField(selectedSymbol.id, 'tweetContent', e.target.value)} />
                     </div>
                   </div>
                 </div>
@@ -676,74 +568,22 @@ export default function WatchlistPage() {
                 {/* 3) Trade Exchange Window */}
                 <div className="border-b pb-4">
                   <div className="flex items-center justify-between mb-2">
-                    <h3 className="font-semibold text-lg">
-                      Trade Exchange Template
-                    </h3>
+                    <h3 className="font-semibold text-lg">Trade Exchange Template</h3>
                     <div className="flex items-center space-x-3">
-                      <FaFlag
-                        size={25}
-                        className="cursor-pointer text-red-500 hover:text-red-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'flag')
-                        }
-                      />
-                      <FaSave
-                        size={25}
-                        className="cursor-pointer text-green-500 hover:text-green-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'save')
-                        }
-                      />
-                      <FaTag
-                        size={25}
-                        className="cursor-pointer text-purple-500 hover:text-purple-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'tag')
-                        }
-                      />
-                      <FaTrash
-                        size={25}
-                        className="cursor-pointer text-red-500 hover:text-red-700"
-                        onClick={() => handleDeleteSymbol(selectedSymbol.id)}
-                      />
+                      <FaFlag size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'flag')} />
+                      <FaSave size={25} className="cursor-pointer text-green-500 hover:text-green-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'save')} />
+                      <FaTag size={25} className="cursor-pointer text-purple-500 hover:text-purple-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'tag')} />
+                      <FaTrash size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => handleDeleteSymbol(selectedSymbol.id)} />
                     </div>
                   </div>
                   <div className="grid grid-cols-1 gap-3">
                     <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Date &amp; Time
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="MM/DD/YYYY HH:MM"
-                        value={selectedSymbol.tradeDateTime}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'tradeDateTime',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Date &amp; Time</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="MM/DD/YYYY HH:MM" value={selectedSymbol.tradeDateTime} onChange={e => updateSymbolField(selectedSymbol.id, 'tradeDateTime', e.target.value)} />
                     </div>
                     <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Trade Exchange Message
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="Trade Exchange message"
-                        value={selectedSymbol.tradeMessage}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'tradeMessage',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Trade Exchange Message</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Trade Exchange message" value={selectedSymbol.tradeMessage} onChange={e => updateSymbolField(selectedSymbol.id, 'tradeMessage', e.target.value)} />
                     </div>
                   </div>
                 </div>
@@ -753,105 +593,37 @@ export default function WatchlistPage() {
                   <div className="flex items-center justify-between mb-2">
                     <h3 className="font-semibold text-lg">Filings Template</h3>
                     <div className="flex items-center space-x-3">
-                      <FaFlag
-                        size={25}
-                        className="cursor-pointer text-red-500 hover:text-red-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'flag')
-                        }
-                      />
-                      <FaSave
-                        size={25}
-                        className="cursor-pointer text-green-500 hover:text-green-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'save')
-                        }
-                      />
-                      <FaTag
-                        size={25}
-                        className="cursor-pointer text-purple-500 hover:text-purple-700"
-                        onClick={() =>
-                          toggleSymbolField(selectedSymbol.id, 'tag')
-                        }
-                      />
-                      <FaTrash
-                        size={25}
-                        className="cursor-pointer text-red-500 hover:text-red-700"
-                        onClick={() => handleDeleteSymbol(selectedSymbol.id)}
-                      />
+                      <FaFlag size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'flag')} />
+                      <FaSave size={25} className="cursor-pointer text-green-500 hover:text-green-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'save')} />
+                      <FaTag size={25} className="cursor-pointer text-purple-500 hover:text-purple-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'tag')} />
+                      <FaTrash size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => handleDeleteSymbol(selectedSymbol.id)} />
                     </div>
                   </div>
                   <div className="grid grid-cols-1 gap-3">
                     <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Date &amp; Time
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="MM/DD/YYYY HH:MM"
-                        value={selectedSymbol.filingsDateTime}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'filingsDateTime',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Date &amp; Time</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="MM/DD/YYYY HH:MM" value={selectedSymbol.filingsDateTime} onChange={e => updateSymbolField(selectedSymbol.id, 'filingsDateTime', e.target.value)} />
                     </div>
                     <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        Form
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="Filing Form"
-                        value={selectedSymbol.filingsForm}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'filingsForm',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">Form</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Filing Form" value={selectedSymbol.filingsForm} onChange={e => updateSymbolField(selectedSymbol.id, 'filingsForm', e.target.value)} />
                     </div>
                     <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">
-                        User Saved Notes
-                      </label>
-                      <input
-                        type="text"
-                        className="w-full border rounded px-2 py-2 dark:bg-gray-800"
-                        placeholder="Let user type here"
-                        value={selectedSymbol.filingsNotes}
-                        onChange={(e) =>
-                          updateSymbolField(
-                            selectedSymbol.id,
-                            'filingsNotes',
-                            e.target.value
-                          )
-                        }
-                      />
+                      <label className="block text-sm text-gray-600 dark:text-gray-300">User Saved Notes</label>
+                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Let user type here" value={selectedSymbol.filingsNotes} onChange={e => updateSymbolField(selectedSymbol.id, 'filingsNotes', e.target.value)} />
                     </div>
                   </div>
                 </div>
               </div>
             ) : (
-              <div className="text-base text-gray-500 dark:text-gray-300">
-                No symbol selected.
-              </div>
+              <div className="text-base text-gray-500 dark:text-gray-300">No symbol selected.</div>
             )}
           </div>
         </div>
 
         {/* VERY BOTTOM: Press Release Template spanning full width */}
         <div className="mt-8 bg-opacity-70 rounded-xl shadow-2xl backdrop-blur-lg p-4 w-full">
-          <h2 className="text-lg font-bold mb-3">
-            Press Release Template (Bottom)
-          </h2>
+          <h2 className="text-lg font-bold mb-3">Press Release Template (Bottom)</h2>
           <div className="overflow-x-auto">
             <table className="w-full border-collapse text-base">
               <thead className="bg-gray-200 dark:bg-gray-700">
@@ -867,42 +639,23 @@ export default function WatchlistPage() {
                 </tr>
               </thead>
               <tbody>
-                {bottomPressReleases.map((pr) => (
-                  <tr
-                    key={pr.id}
-                    className="border-b transition duration-200 hover:bg-gradient-to-r hover:from-blue-500 hover:via-cyan-500 hover:to-purple-500 hover:text-white"
-                  >
+                {bottomPressReleases.map(pr => (
+                  <tr key={pr.id} className="border-b transition duration-200 hover:bg-gradient-to-r hover:from-blue-500 hover:via-cyan-500 hover:to-purple-500 hover:text-white">
                     <td className="px-3 py-2">{pr.symbol}</td>
                     <td className="px-3 py-2">{pr.companyTitle}</td>
                     <td className="px-3 py-2">{pr.timeStamp}</td>
                     <td className="px-3 py-2">{pr.headline}</td>
                     <td className="px-3 py-2">
-                      <FaFlag
-                        size={25}
-                        className="cursor-pointer text-red-500 hover:text-red-700"
-                        onClick={() => toggleBottomPRField(pr.id, 'flag')}
-                      />
+                      <FaFlag size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => toggleBottomPRField(pr.id, 'flag')} />
                     </td>
                     <td className="px-3 py-2">
-                      <FaSave
-                        size={25}
-                        className="cursor-pointer text-green-500 hover:text-green-700"
-                        onClick={() => toggleBottomPRField(pr.id, 'save')}
-                      />
+                      <FaSave size={25} className="cursor-pointer text-green-500 hover:text-green-700" onClick={() => toggleBottomPRField(pr.id, 'save')} />
                     </td>
                     <td className="px-3 py-2">
-                      <FaTag
-                        size={25}
-                        className="cursor-pointer text-purple-500 hover:text-purple-700"
-                        onClick={() => toggleBottomPRField(pr.id, 'tag')}
-                      />
+                      <FaTag size={25} className="cursor-pointer text-purple-500 hover:text-purple-700" onClick={() => toggleBottomPRField(pr.id, 'tag')} />
                     </td>
                     <td className="px-3 py-2">
-                      <FaTrash
-                        size={25}
-                        className="cursor-pointer text-red-500 hover:text-red-700"
-                        onClick={() => handleDeleteBottomPR(pr.id)}
-                      />
+                      <FaTrash size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => handleDeleteBottomPR(pr.id)} />
                     </td>
                   </tr>
                 ))}
@@ -910,6 +663,7 @@ export default function WatchlistPage() {
             </table>
           </div>
         </div>
+
       </div>
     </div>
   );
