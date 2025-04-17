@@ -2,10 +2,9 @@
 
 // Keep track of all connected ports
 const connections = [];
-let polygonSocket = null;
-let isPolygonConnected = false;
-let authDone = false;
-let storedApiKey = null; // Store API key for fallback REST requests
+
+// Azure Function base endpoint for quotes
+const azureFunctionUrl = "https://tradecompanion.azurewebsites.net/api/";
 
 // Set to track subscribed symbols (to avoid duplicate subscription messages)
 const subscribedSymbols = new Set();
@@ -62,103 +61,41 @@ function broadcast(message) {
 }
 
 /**
- * Fallback: Fetch previous close (last price) from Polygon’s REST API
- * if the WebSocket connection is closed.
+ * Fetch quote data for a given symbol via the Azure Function endpoint.
  */
-function fetchLastPricesForSymbols(symbols, apiKey) {
-  symbols.forEach((symbol) => {
-    // Construct the REST URL for the previous close data.
-    const url = `https://api.polygon.io/v2/aggs/ticker/${symbol}/prev?adjusted=true&apiKey=${apiKey}`;
-    console.log(`[Worker] Fetching last price for ${symbol} from URL: ${url}`);
-    fetch(url)
-      .then((res) => {
-        console.log(`[Worker] Response status for ${symbol}: ${res.status}`);
-        return res.json();
-      })
-      .then((data) => {
-        console.log(`[Worker] Fetched data for ${symbol}:`, data);
-        if (data && data.results && data.results.length > 0) {
-          const result = data.results[0];
-          const lastPrice = result.c.toString();
-          const percentChange = result.o
-            ? (((result.c - result.o) / result.o) * 100).toFixed(2)
-            : '0';
-          console.log(`[Worker] ${symbol} fallback: lastPrice=${lastPrice}, percentChange=${percentChange}`);
-          quoteManager.publish(symbol, { l: lastPrice, pc: percentChange });
-        } else {
-          console.warn(`[Worker] No results for ${symbol} from REST API.`);
-        }
-      })
-      .catch((err) => {
-        console.error(`[Worker] Error fetching last price for ${symbol}:`, err);
-      });
+function fetchQuoteForSymbol(symbol) {
+  // Construct the REST URL for the quote data.
+  const url = `${azureFunctionUrl}quote?symbol=${encodeURIComponent(symbol)}`;
+  console.log(`[Worker] Fetching quote for ${symbol} from URL: ${url}`);
+  fetch(url)
+    .then((res) => {
+      if (!res.ok) {
+        throw new Error(`HTTP error! status: ${res.status}`);
+      }
+      return res.json();
+    })
+    .then((data) => {
+      console.log(`[Worker] Fetched data for ${symbol}:`, data);
+      // Publish the fetched quote data to subscribers.
+      quoteManager.publish(symbol, data);
+    })
+    .catch((err) => {
+      console.error(`[Worker] Error fetching quote for ${symbol}:`, err);
+    });
+}
+
+/**
+ * Poll all subscribed symbols periodically.
+ */
+function pollQuotes() {
+  if (subscribedSymbols.size === 0) return;
+  subscribedSymbols.forEach((symbol) => {
+    fetchQuoteForSymbol(symbol);
   });
 }
 
-/**
- * Establish the Polygon WebSocket connection using the API key.
- */
-function connectToPolygon(apiKey) {
-  storedApiKey = apiKey;
-  if (polygonSocket && (polygonSocket.readyState === WebSocket.OPEN || polygonSocket.readyState === WebSocket.CONNECTING)) {
-    console.log("Polygon WebSocket already connected or connecting.");
-    return;
-  }
-  polygonSocket = new WebSocket('wss://socket.polygon.io/stocks');
-
-  polygonSocket.onopen = () => {
-    console.log("Polygon WebSocket connected.");
-    isPolygonConnected = true;
-    polygonSocket.send(JSON.stringify({ action: "auth", params: apiKey }));
-    broadcast({ type: 'status', message: 'Polygon connected, auth sent' });
-  };
-
-  polygonSocket.onerror = (error) => {
-    console.error("Polygon WebSocket error:", error);
-    broadcast({ type: 'error', message: error.message });
-  };
-
-  polygonSocket.onclose = () => {
-    console.log("Polygon WebSocket closed.");
-    isPolygonConnected = false;
-    authDone = false;
-    broadcast({ type: 'status', message: 'Polygon closed' });
-    if (storedApiKey) {
-      // Trigger REST fallback for all subscribed symbols.
-      fetchLastPricesForSymbols(Array.from(subscribedSymbols), storedApiKey);
-    }
-  };
-
-  polygonSocket.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      if (Array.isArray(data)) {
-        data.forEach(handlePolygonMessage);
-      } else {
-        handlePolygonMessage(data);
-      }
-    } catch (err) {
-      console.error("Error parsing Polygon message:", err);
-    }
-  };
-}
-
-/**
- * Handle messages from Polygon.
- */
-function handlePolygonMessage(message) {
-  console.log("Received message from Polygon:", message);
-  broadcast({ type: 'message', payload: message });
-  if (message.ev === 'status' && message.message === 'authenticated') {
-    authDone = true;
-    broadcast({ type: 'status', message: 'Authenticated with Polygon' });
-    return;
-  }
-  if (message.T && message.ev !== 'status') {
-    const symbol = message.T;
-    quoteManager.publish(symbol, message);
-  }
-}
+// Start polling every second (adjust interval as needed)
+setInterval(pollQuotes, 1000);
 
 /**
  * onconnect handler for shared worker clients.
@@ -167,28 +104,38 @@ onconnect = function (e) {
   const port = e.ports[0];
   connections.push(port);
   console.log("New port connected to shared worker.");
-  port.postMessage({ type: 'status', message: 'Shared worker connected' });
+  port.postMessage({
+    type: 'status',
+    message: 'Shared worker connected to Azure Function endpoint',
+  });
   port.onmessage = function (event) {
     const data = event.data;
     if (data.type === "connect") {
-      connectToPolygon(data.apiKey);
+      // Client initiated connection message.
+      broadcast({ type: 'status', message: 'Connected to Azure Function endpoint' });
     } else if (data.type === "subscribe") {
       if (data.symbol) {
+        // Register subscription for the symbol.
         quoteManager.subscribe(data.symbol, port);
         if (!subscribedSymbols.has(data.symbol)) {
-          polygonSocket.send(JSON.stringify({ action: "subscribe", params: "T." + data.symbol }));
           subscribedSymbols.add(data.symbol);
-          broadcast({ type: 'status', message: `Subscribed to ${data.symbol}` });
+          broadcast({
+            type: 'status',
+            message: `Subscribed to ${data.symbol}`,
+          });
         }
       }
     } else if (data.type === "unsubscribe") {
       if (data.symbol) {
+        // Remove the subscription for the symbol.
         quoteManager.unsubscribe(data.symbol, port);
         const subs = quoteManager.subscribers.get(data.symbol);
         if (!subs || subs.length === 0) {
-          polygonSocket.send(JSON.stringify({ action: "unsubscribe", params: "T." + data.symbol }));
           subscribedSymbols.delete(data.symbol);
-          broadcast({ type: 'status', message: `Unsubscribed from ${data.symbol}` });
+          broadcast({
+            type: 'status',
+            message: `Unsubscribed from ${data.symbol}`,
+          });
         }
       }
     } else {

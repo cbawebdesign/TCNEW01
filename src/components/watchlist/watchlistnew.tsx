@@ -229,9 +229,9 @@ export default function WatchlistPage() {
       };
 
       console.log('[WatchlistPage] Sending connect message to shared worker.');
+      // Note: We removed the API key from the connect message.
       worker.port.postMessage({
-        type: 'connect',
-        apiKey: process.env.NEXT_PUBLIC_POLYGON_API_KEY,
+        type: 'connect'
       });
     }
   }, []); // Runs once on mount
