@@ -1,670 +1,578 @@
-import React, { useState, useEffect } from 'react';
-import LogoImage from '~/core/ui/Logo/LogoImage';
-import { FaFlag, FaSave, FaTag, FaTrash } from 'react-icons/fa';
+// src/components/watchlist/WatchlistPage.tsx
+'use client';
 
-/** Each symbol’s data in a watchlist */
+import React, { useState, useEffect, useRef } from 'react';
+import * as signalR from '@microsoft/signalr';
+import { getAuth } from 'firebase/auth';
+import LogoImage from '~/core/ui/Logo/LogoImage';
+import {
+  FaRegComment,
+  FaBullhorn,
+  FaTrash,
+  FaFileAlt,
+  FaBell
+} from 'react-icons/fa';
+
 interface WatchlistSymbol {
   id: number;
   symbol: string;
   percentChange: string;
   lastPrice: string;
-  // Press Release
-  pressName: string;
-  pressAccount: string;
-  pressDateTime: string;
-  pressHeadline: string;
-  // Tweets
-  tweetName: string;
-  tweetAccount: string;
-  tweetDateTime: string;
-  tweetContent: string;
-  // Trade Exchange
-  tradeDateTime: string;
-  tradeMessage: string;
-  // Filings
-  filingsDateTime: string;
-  filingsForm: string;
-  filingsNotes: string;
-  // Additional flags
-  flag: boolean;
-  save: boolean;
-  tag: boolean;
 }
 
-/** A watchlist has a name and an array of symbols */
 interface Watchlist {
   name: string;
   symbols: WatchlistSymbol[];
 }
 
-/** For the bottom Press Release Template that spans full width */
-interface BottomPressRelease {
-  id: number;
-  symbol: string;
-  companyTitle: string;
-  timeStamp: string;
-  headline: string;
-  flag: boolean;
-  save: boolean;
-  tag: boolean;
+interface Tweet {
+  id: string;
+  username: string;
+  created_at: string;
+  text: string;
+  symbol?: string;
 }
 
-/**
- * Returns a singleton instance of our SharedWorker.
- * This caches the worker on the window object.
- */
-function getSharedWorker(): SharedWorker {
-  if (!(window as any).__sharedWorkerInstance) {
-    console.log('[WatchlistPage] Creating new SharedWorker instance.');
-    (window as any).__sharedWorkerInstance = new SharedWorker('/shared-worker.js');
-    (window as any).__sharedWorkerInstance.port.start();
-  } else {
-    console.log('[WatchlistPage] Reusing existing SharedWorker instance.');
-  }
-  return (window as any).__sharedWorkerInstance;
+interface TradeExchangePost {
+  id: string;
+  source: string;
+  content: string;
+  save_time_utc: string;
+}
+
+interface Filing {
+  symbol: string;
+  form: string;
+  dcn: string;
+  cik: number;
+  save_time: string;
+  url: string;
+}
+
+interface Quote {
+  s: string;
+  l: number;
+  o?: number;
+}
+
+interface PriceAlert {
+  id: string;               // Firestore doc ID
+  symbol: string;
+  target: number;
+  direction: 'above' | 'below';
+  note: string;
+  triggered: boolean;
 }
 
 export default function WatchlistPage() {
-  const [theme, setTheme] = useState<'light' | 'dark'>('light');
-
-  // Example watchlists.
-  const [watchlists, setWatchlists] = useState<Watchlist[]>([
-    {
-      name: 'Watchlist 1',
-      symbols: [
-        {
-          id: 1,
-          symbol: 'AAPL',
-          percentChange: '+2.3%',
-          lastPrice: '238.59',
-          pressName: '',
-          pressAccount: '',
-          pressDateTime: '',
-          pressHeadline: '',
-          tweetName: '',
-          tweetAccount: '',
-          tweetDateTime: '',
-          tweetContent: '',
-          tradeDateTime: '',
-          tradeMessage: '',
-          filingsDateTime: '',
-          filingsForm: '',
-          filingsNotes: '',
-          flag: false,
-          save: false,
-          tag: false,
-        },
-        {
-          id: 2,
-          symbol: 'MSTR',
-          percentChange: '+5.9%',
-          lastPrice: '362.37',
-          pressName: '',
-          pressAccount: '',
-          pressDateTime: '',
-          pressHeadline: '',
-          tweetName: '',
-          tweetAccount: '',
-          tweetDateTime: '',
-          tweetContent: '',
-          tradeDateTime: '',
-          tradeMessage: '',
-          filingsDateTime: '',
-          filingsForm: '',
-          filingsNotes: '',
-          flag: false,
-          save: false,
-          tag: false,
-        },
-      ],
-    },
-    {
-      name: 'Watchlist 2',
-      symbols: [
-        {
-          id: 1,
-          symbol: 'TSLA',
-          percentChange: '+3.4%',
-          lastPrice: '215.65',
-          pressName: '',
-          pressAccount: '',
-          pressDateTime: '',
-          pressHeadline: '',
-          tweetName: '',
-          tweetAccount: '',
-          tweetDateTime: '',
-          tweetContent: '',
-          tradeDateTime: '',
-          tradeMessage: '',
-          filingsDateTime: '',
-          filingsForm: '',
-          filingsNotes: '',
-          flag: false,
-          save: false,
-          tag: false,
-        },
-      ],
-    },
-  ]);
-
+  // 1) Watchlists
+  const [watchlists, setWatchlists] = useState<Watchlist[]>([]);
   const [selectedWatchlistIndex, setSelectedWatchlistIndex] = useState(0);
   const [newWatchlistName, setNewWatchlistName] = useState('');
   const [newSymbolText, setNewSymbolText] = useState('');
-  // Track which symbol is selected—auto-select on mount or if none is selected.
-  const [selectedSymbolId, setSelectedSymbolId] = useState<number | null>(null);
-  // Bottom press release section.
-  const [bottomPressReleases, setBottomPressReleases] = useState<BottomPressRelease[]>([
-    {
-      id: 1,
-      symbol: 'GOOG',
-      companyTitle: 'Alphabet Inc.',
-      timeStamp: '10:30 AM',
-      headline: 'Press Release Headline 1',
-      flag: false,
-      save: false,
-      tag: false,
-    },
-    {
-      id: 2,
-      symbol: 'AMZN',
-      companyTitle: 'Amazon.com Inc.',
-      timeStamp: '11:45 AM',
-      headline: 'Press Release Headline 2',
-      flag: true,
-      save: false,
-      tag: true,
-    },
-  ]);
 
-  // Set theme on mount.
-  useEffect(() => {
-    const darkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    setTheme(darkMode ? 'dark' : 'light');
-    console.log('[WatchlistPage] Theme set to:', darkMode ? 'dark' : 'light');
-  }, []);
+  // 2) Quotes (SignalR)
+  const [connection, setConnection] = useState<signalR.HubConnection | null>(null);
 
-  const currentWatchlist = watchlists[selectedWatchlistIndex];
+  // 3) Tweets
+  const [tweetsBySymbol, setTweetsBySymbol] = useState<Record<string, Tweet[]>>({});
+  const [tweetFilter, setTweetFilter] = useState<string | null>('*');
+  const [expandedTweets, setExpandedTweets] = useState<Set<string>>(new Set());
 
-  // Auto-select first symbol only if none is selected.
-  useEffect(() => {
-    if (currentWatchlist && currentWatchlist.symbols.length > 0 && selectedSymbolId === null) {
-      setSelectedSymbolId(currentWatchlist.symbols[0].id);
-      console.log('[WatchlistPage] Auto-selected first symbol:', currentWatchlist.symbols[0].symbol);
-    }
-  }, [selectedWatchlistIndex, currentWatchlist, selectedSymbolId]);
+  // 4) TradeExchange
+  const [tradePosts, setTradePosts] = useState<TradeExchangePost[]>([]);
 
-  /***************************************************
-   * Worker Connection (Mount Only)
-   ***************************************************/
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      const worker = getSharedWorker();
-      console.log('[WatchlistPage] Setting up worker onmessage handler.');
-      worker.port.onmessage = (event) => {
-        console.log('[WatchlistPage] Message from SharedWorker:', event.data);
-        if (event.data.type === 'quote' && event.data.symbol) {
-          setWatchlists(prev => {
-            // Update every watchlist that contains this symbol.
-            const newState = prev.map(wl => {
-              if (wl.symbols.some(sym => sym.symbol === event.data.symbol)) {
-                const updatedSymbols = wl.symbols.map(sym => {
-                  if (sym.symbol === event.data.symbol) {
-                    console.log('[WatchlistPage] Updating quote for:', event.data.symbol, event.data.payload);
-                    return {
-                      ...sym,
-                      lastPrice: event.data.payload?.l ? event.data.payload.l.toString() : sym.lastPrice,
-                      percentChange: event.data.payload?.pc ? event.data.payload.pc.toString() : sym.percentChange,
-                    };
-                  }
-                  return sym;
-                });
-                return { ...wl, symbols: updatedSymbols };
-              }
-              return wl;
-            });
-            console.log('[WatchlistPage] Updated watchlists state:', newState);
-            return newState;
-          });
-        }
-      };
+  // 5) Filings
+  const [rawFilings, setRawFilings] = useState<Filing[]>([]);
+  const [filings, setFilings] = useState<Filing[]>([]);
 
-      console.log('[WatchlistPage] Sending connect message to shared worker.');
-      // Note: We removed the API key from the connect message.
-      worker.port.postMessage({
-        type: 'connect'
-      });
-    }
-  }, []); // Runs once on mount
+  // 6) Price Alerts + Toasts
+  const [priceAlerts, setPriceAlerts] = useState<PriceAlert[]>([]);
+  const [alertModalSymbol, setAlertModalSymbol] = useState<string|null>(null);
+  const [newAlertTarget, setNewAlertTarget] = useState<number>(0);
+  const [newAlertDirection, setNewAlertDirection] = useState<'above'|'below'>('above');
+  const [newAlertNote, setNewAlertNote] = useState<string>('');
+  const [notifications, setNotifications] = useState<string[]>([]);
+  const priceAlertsRef = useRef<PriceAlert[]>([]);
+  useEffect(() => { priceAlertsRef.current = priceAlerts; }, [priceAlerts]);
 
-  /***************************************************
-   * Subscribe to Symbols When Current Watchlist Changes
-   ***************************************************/
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      const worker = getSharedWorker();
-      const uniqueSymbols = Array.from(new Set(currentWatchlist.symbols.map(s => s.symbol)));
-      console.log('[WatchlistPage] Subscribing to symbols:', uniqueSymbols);
-      uniqueSymbols.forEach(symbol => {
-        worker.port.postMessage({ type: 'subscribe', symbol });
-      });
-    }
-  }, [currentWatchlist]);
+  const srUrl = 'https://tradecompanion.azurewebsites.net/api';
+  const current = watchlists[selectedWatchlistIndex] || { name:'', symbols:[] };
 
-  /***************************************************
-   * Poll for Missing Prices Every 30 Seconds
-   ***************************************************/
-  useEffect(() => {
-    const intervalId = setInterval(() => {
-      // Find symbols in the current watchlist with lastPrice "0.00" (i.e. missing updates)
-      const missingSymbols = currentWatchlist.symbols
-        .filter(sym => sym.lastPrice === '0.00')
-        .map(sym => sym.symbol);
-      if (missingSymbols.length > 0) {
-        console.log('[WatchlistPage] Polling: Re-subscribing to missing symbols:', missingSymbols);
-        const worker = getSharedWorker();
-        missingSymbols.forEach(symbol => {
-          worker.port.postMessage({ type: 'subscribe', symbol });
-        });
-      }
-    }, 30000); // every 30 seconds
-    return () => clearInterval(intervalId);
-  }, [currentWatchlist]);
+  // Button base styles
+  const btnClasses = `
+    bg-gradient-to-r from-blue-600/20 via-cyan-300/20 to-purple-600/20
+    border border-gray-600 rounded px-4 py-2
+    transition transform hover:-translate-y-0.5 hover:scale-105
+    hover:bg-gradient-to-r hover:from-blue-500/40 hover:via-cyan-400/40 hover:to-purple-500/40
+    hover:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50
+  `;
 
-  /***************************************************
-   * WATCHLIST ACTIONS
-   ***************************************************/
-  const handleAddWatchlist = () => {
-    const trimmed = newWatchlistName.trim();
-    if (!trimmed) return;
-    const newWL: Watchlist = { name: trimmed, symbols: [] };
-    setWatchlists(prev => [...prev, newWL]);
-    setSelectedWatchlistIndex(watchlists.length);
-    setNewWatchlistName('');
-    setSelectedSymbolId(null);
-    console.log('[WatchlistPage] Added new watchlist:', trimmed);
-  };
-
-  const handleDeleteWatchlist = () => {
-    if (watchlists.length === 1) return;
-    setWatchlists(prev => prev.filter((_, i) => i !== selectedWatchlistIndex));
-    setSelectedWatchlistIndex(0);
-    setSelectedSymbolId(null);
-    console.log('[WatchlistPage] Deleted watchlist at index:', selectedWatchlistIndex);
-  };
-
-  /***************************************************
-   * SYMBOL ACTIONS
-   ***************************************************/
-  const handleAddSymbol = () => {
-    if (!newSymbolText.trim() || !currentWatchlist) return;
-    const newId = currentWatchlist.symbols.length
-      ? currentWatchlist.symbols[currentWatchlist.symbols.length - 1].id + 1
-      : 1;
-    const newSymbol: WatchlistSymbol = {
-      id: newId,
-      symbol: newSymbolText.toUpperCase(),
-      percentChange: '+0.0%',
-      lastPrice: '0.00',
-      pressName: '',
-      pressAccount: '',
-      pressDateTime: '',
-      pressHeadline: '',
-      tweetName: '',
-      tweetAccount: '',
-      tweetDateTime: '',
-      tweetContent: '',
-      tradeDateTime: '',
-      tradeMessage: '',
-      filingsDateTime: '',
-      filingsForm: '',
-      filingsNotes: '',
-      flag: false,
-      save: false,
-      tag: false,
-    };
-    const updatedWL: Watchlist = {
-      ...currentWatchlist,
-      symbols: [...currentWatchlist.symbols, newSymbol],
-    };
-    setWatchlists(prev =>
-      prev.map((wl, i) => (i === selectedWatchlistIndex ? updatedWL : wl))
-    );
-    setSelectedSymbolId(newId);
-    console.log('[WatchlistPage] Added new symbol:', newSymbol.symbol);
-
-    const worker = getSharedWorker();
-    console.log('[WatchlistPage] Subscribing to new symbol:', newSymbol.symbol);
-    worker.port.postMessage({ type: 'subscribe', symbol: newSymbol.symbol });
-  };
-
-  const handleDeleteSymbol = (symbolId: number) => {
-    if (!currentWatchlist) return;
-    const updatedSymbols = currentWatchlist.symbols.filter(s => s.id !== symbolId);
-    const updatedWL = { ...currentWatchlist, symbols: updatedSymbols };
-    setWatchlists(prev =>
-      prev.map((wl, i) => (i === selectedWatchlistIndex ? updatedWL : wl))
-    );
-    if (symbolId === selectedSymbolId) {
-      setSelectedSymbolId(updatedSymbols.length > 0 ? updatedSymbols[0].id : null);
-    }
-    console.log('[WatchlistPage] Deleted symbol with id:', symbolId);
-  };
-
-  const toggleSymbolField = (
-    symbolId: number,
-    field: keyof Pick<WatchlistSymbol, 'flag' | 'save' | 'tag'>
-  ) => {
-    if (!currentWatchlist) return;
-    const updatedSymbols = currentWatchlist.symbols.map(sym =>
-      sym.id === symbolId ? { ...sym, [field]: !sym[field] } : sym
-    );
-    const updatedWL = { ...currentWatchlist, symbols: updatedSymbols };
-    setWatchlists(prev =>
-      prev.map((wl, i) => (i === selectedWatchlistIndex ? updatedWL : wl))
-    );
-    console.log('[WatchlistPage] Toggled field', field, 'for symbol id:', symbolId);
-  };
-
-  const updateSymbolField = (
-    symbolId: number,
-    field: keyof WatchlistSymbol,
-    newValue: string
-  ) => {
-    if (!currentWatchlist) return;
-    const updatedSymbols = currentWatchlist.symbols.map(sym =>
-      sym.id === symbolId ? { ...sym, [field]: newValue } : sym
-    );
-    const updatedWL = { ...currentWatchlist, symbols: updatedSymbols };
-    setWatchlists(prev =>
-      prev.map((wl, i) => (i === selectedWatchlistIndex ? updatedWL : wl))
-    );
-    console.log('[WatchlistPage] Updated field', field, 'for symbol id:', symbolId, 'to:', newValue);
-  };
-
-  const selectedSymbol = currentWatchlist?.symbols.find(s => s.id === selectedSymbolId) || null;
-
-  /***************************************************
-   * BOTTOM PRESS RELEASES ACTIONS
-   ***************************************************/
-  const toggleBottomPRField = (
-    id: number,
-    field: keyof Pick<BottomPressRelease, 'flag' | 'save' | 'tag'>
-  ) => {
-    setBottomPressReleases(prev =>
-      prev.map(item => (item.id === id ? { ...item, [field]: !item[field] } : item))
-    );
-    console.log('[WatchlistPage] Toggled Bottom PR field', field, 'for id:', id);
-  };
-
-  const handleDeleteBottomPR = (id: number) => {
-    setBottomPressReleases(prev => prev.filter(item => item.id !== id));
-    console.log('[WatchlistPage] Deleted Bottom PR with id:', id);
-  };
-
-  if (!currentWatchlist) {
-    return (
-      <div className={`flex items-center justify-center min-h-screen ${theme === 'dark' ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-800'}`}>
-        <p>No watchlists available.</p>
-      </div>
-    );
+  // Helper: get Firebase ID token
+  async function getIdToken(): Promise<string | null> {
+    const user = getAuth().currentUser;
+    return user ? await user.getIdToken() : null;
   }
 
-  return (
-    <div className={`relative min-h-screen text-base ${theme === 'dark' ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-800'}`}>
-      {/* Gradient Background */}
-      <div className={`absolute inset-0 ${theme === 'dark' ? 'bg-gradient-to-br from-gray-800 via-gray-900 to-black' : 'bg-gradient-to-br from-blue-50 via-blue-100 to-purple-200'} z-0`} style={{ backgroundAttachment: 'fixed' }} />
-      
-      <div className="relative z-10 p-6 max-w-7xl mx-auto space-y-4">
-        {/* Centered Logo */}
-        <div className="flex justify-center">
-          <LogoImage style={{ width: '200px', height: '120px' }} />
-        </div>
+  // Load price alerts from Firebase
+  useEffect(() => {
+    (async () => {
+      try {
+        const token = await getIdToken();
+        if (!token) return;
+        const res = await fetch('/api/alerts/priceAlerts', {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data: PriceAlert[] = await res.json();
+        setPriceAlerts(data);
+      } catch (e) {
+        console.error('❌ Failed to load price alerts', e);
+      }
+    })();
+  }, []);
 
-        {/* Top Bar */}
-        <div className="flex flex-wrap items-center space-x-3">
-          <h1 className="text-3xl font-extrabold">Top Ranked</h1>
-          <select
-            value={selectedWatchlistIndex}
-            onChange={(e) => {
-              setSelectedWatchlistIndex(Number(e.target.value));
-              console.log('[WatchlistPage] Changed selected watchlist index to:', e.target.value);
-            }}
-            className={`text-sm px-3 py-2 border rounded-lg ${theme === 'dark' ? 'bg-gray-800 text-white border-gray-600' : 'bg-white text-gray-800 border-gray-300'}`}
-          >
-            {watchlists.map((wl, index) => (
-              <option key={index} value={index}>
-                {wl.name}
-              </option>
-            ))}
-          </select>
-          <input
-            type="text"
-            placeholder="New watchlist name"
-            value={newWatchlistName}
-            onChange={(e) => setNewWatchlistName(e.target.value)}
-            className={`text-sm px-3 py-2 border rounded-lg ${theme === 'dark' ? 'bg-gray-800 text-white border-gray-600' : 'bg-white text-gray-800 border-gray-300'}`}
-            style={{ width: '180px' }}
-          />
-          <button onClick={handleAddWatchlist} className="text-sm px-3 py-2 bg-blue-600 text-white rounded shadow hover:scale-105 transition transform">
-            New
-          </button>
-          <button onClick={handleDeleteWatchlist} className="text-sm px-3 py-2 bg-red-600 text-white rounded shadow hover:scale-105 transition transform">
-            Delete
-          </button>
-          <div className="flex items-center space-x-2 ml-4">
+  // ------------------------------
+  // 2) SignalR: Quotes & Filings
+  // ------------------------------
+  useEffect(() => {
+    const conn = new signalR.HubConnectionBuilder()
+      .withUrl(srUrl, { transport: signalR.HttpTransportType.WebSockets, withCredentials:false })
+      .withAutomaticReconnect()
+      .configureLogging(signalR.LogLevel.Warning)
+      .build();
+
+    conn.on('BroadcastQuotes', (data: Quote[]) => {
+      setWatchlists(prev => {
+        const updated = prev.map(wl => ({
+          ...wl,
+          symbols: wl.symbols.map(s => {
+            const q = data.find(q => q.s === s.symbol);
+            if (!q) return s;
+            const last = q.l;
+            const open = (q.o ?? parseFloat(s.lastPrice)) || 0;
+            return {
+              ...s,
+              lastPrice: last.toFixed(2),
+              percentChange: open > 0
+                ? `${(((last - open)/open)*100).toFixed(2)}%`
+                : s.percentChange
+            };
+          })
+        }));
+        // Check price alerts
+        for (const q of data) {
+          for (const alert of priceAlertsRef.current) {
+            if (!alert.triggered && alert.symbol === q.s) {
+              if (
+                (alert.direction === 'above' && q.l >= alert.target) ||
+                (alert.direction === 'below' && q.l <= alert.target)
+              ) {
+                setPriceAlerts(pa =>
+                  pa.map(a =>
+                    a.id === alert.id ? { ...a, triggered: true } : a
+                  )
+                );
+                setNotifications(n => [
+                  ...n,
+                  `🔔 ${alert.symbol} is ${alert.direction} ${alert.target.toFixed(2)}`
+                ]);
+              }
+            }
+          }
+        }
+        return updated;
+      });
+    });
+
+    conn.on('BroadcastFiling', (f: Filing) => {
+      setRawFilings(prev => [f, ...prev]);
+    });
+
+    conn.start().then(() => setConnection(conn)).catch(console.error);
+    return () => void conn.stop();
+  }, []);
+
+  // Auto‑subscribe
+  useEffect(() => {
+    if (!connection) return;
+    current.symbols.forEach(s => {
+      connection.invoke('Subscribe', s.symbol).catch(console.error);
+    });
+  }, [connection, current.symbols]);
+
+  const subscribe = async (sym:string) => {
+    if (!connection?.connectionId) return;
+    await fetch(`${srUrl}/SubL1?symbol=${sym}&connectionId=${connection.connectionId}`);
+  };
+
+  // ------------------------------
+  // 3) Load Watchlists
+  // ------------------------------
+  useEffect(() => {
+    (async () => {
+      const auth = getAuth(), user = auth.currentUser;
+      if (!user) return;
+      const res = await fetch('/api/watchlist/loadwatchlist', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ uid:user.uid })
+      });
+      if (!res.ok) return;
+      const { watchlists } = await res.json();
+      setWatchlists(watchlists.length
+        ? watchlists
+        : [{ name:'Watchlist 1', symbols:[] }]
+      );
+    })();
+  }, []);
+
+  // ------------------------------
+  // 4) CRUD: Watchlist & Symbols
+  // ------------------------------
+  const addWatchlist = () => {
+    const nm = newWatchlistName.trim(); if (!nm) return;
+    setWatchlists(prev => [...prev, { name:nm, symbols:[] }]);
+    setSelectedWatchlistIndex(watchlists.length);
+    setNewWatchlistName('');
+  };
+  const addSymbol = () => {
+    const txt = newSymbolText.trim().toUpperCase(); if (!txt) return;
+    const id = current.symbols.length
+      ? current.symbols[current.symbols.length-1].id + 1
+      : 1;
+    const sym = { id, symbol:txt, percentChange:'+0.00%', lastPrice:'0.00' };
+    setWatchlists(prev =>
+      prev.map((w,i) =>
+        i === selectedWatchlistIndex
+          ? { ...w, symbols:[...w.symbols,sym] }
+          : w
+      )
+    );
+    setNewSymbolText('');
+    subscribe(txt);
+  };
+  const deleteSymbol = (symbolId:number) => {
+    setWatchlists(prev =>
+      prev.map((w,i) =>
+        i === selectedWatchlistIndex
+          ? { ...w, symbols:w.symbols.filter(s => s.id !== symbolId) }
+          : w
+      )
+    );
+    setTweetFilter('*');
+  };
+  const saveToFirebase = async () => {
+    const auth = getAuth(), user = auth.currentUser; if (!user){ alert('Please log in'); return; }
+    const res = await fetch('/api/watchlist/savewatchlist',{ method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body:JSON.stringify({ uid:user.uid, watchlists })
+    });
+    alert(res.ok ? '✅ Saved' : '❌ Save failed');
+  };
+
+  // ------------------------------
+  // 5) Tweets
+  // ------------------------------
+  useEffect(() => {
+    if (!current.symbols.length) { setTweetsBySymbol({}); return; }
+    (async () => {
+      try {
+        const res = await fetch(`${srUrl}/tweets?since=0&t=${Date.now()}`);
+        if (!res.ok) throw new Error(await res.text());
+        const all:Tweet[] = await res.json();
+        const bySym:Record<string,Tweet[]> = {};
+        current.symbols.forEach(s => {
+          bySym[s.symbol] = all
+            .filter(t => t.text.includes(`$${s.symbol}`))
+            .slice(-6).reverse();
+        });
+        setTweetsBySymbol(bySym);
+        setTweetFilter('*');
+        setExpandedTweets(new Set());
+      } catch(e) {
+        console.error('Error loading tweets', e);
+        setTweetsBySymbol({});
+      }
+    })();
+  }, [current.symbols]);
+
+  // ------------------------------
+  // 6) TradeExchange
+  // ------------------------------
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(`${srUrl}/TradeExchangeGet`);
+        if (!res.ok) throw new Error(await res.text());
+        setTradePosts(await res.json());
+      } catch(e) {
+        console.error('Error loading TradeExchangeGet posts', e);
+      }
+    })();
+  }, []);
+
+  // ------------------------------
+  // 7) Initial Filings
+  // ------------------------------
+  useEffect(() => {
+    (async () => {
+      try {
+        const since = new Date(0).toISOString().substring(0,19);
+        const res = await fetch(`${srUrl}/Filings?since=${encodeURIComponent(since)}`);
+        if (!res.ok) throw new Error(await res.text());
+        setRawFilings(await res.json());
+      } catch(e) {
+        console.error('Failed to load initial filings', e);
+      }
+    })();
+  }, []);
+
+  // Filter filings
+  useEffect(() => {
+    const allowed = new Set(current.symbols.map(s => s.symbol));
+    setFilings(
+      rawFilings.filter(f =>
+        f.symbol.split(',').some(sym => allowed.has(sym.trim()))
+      )
+    );
+  }, [rawFilings, current.symbols]);
+
+  const toggleExpand = (id:string) => {
+    setExpandedTweets(prev => {
+      const nxt = new Set(prev);
+      nxt.has(id) ? nxt.delete(id) : nxt.add(id);
+      return nxt;
+    });
+  };
+  const linkify = (text:string) =>
+    text.split(/(https?:\/\/[^\s]+)/g).map((part,i) =>
+      /^https?:\/\//.test(part)
+        ? <a key={i} href={part} target="_blank" rel="noopener noreferrer" className="text-blue-300 underline">{part}</a>
+        : part
+    );
+  const displayedTweets = tweetFilter==='*'
+    ? Object.entries(tweetsBySymbol).flatMap(([sym,arr]) => arr.map(t => ({ ...t, symbol:sym }))).slice(0,12)
+    : (tweetsBySymbol[tweetFilter!] || []).map(t => ({ ...t, symbol: tweetFilter! }));
+  const displayedTrades = tradePosts.filter(p => p.content.length >= 5).slice(-6).reverse();
+
+  // ------------------------------
+  // Price‑Alerts API: create & delete
+  // ------------------------------
+  const createPriceAlert = async () => {
+    if (!alertModalSymbol) return;
+    try {
+      const token = await getIdToken(); if (!token) throw new Error('Not authenticated');
+      const res = await fetch('/api/alerts/priceAlerts', {
+        method: 'POST',
+        headers: {
+          'Content-Type':'application/json',
+          Authorization:`Bearer ${token}`
+        },
+        body: JSON.stringify({
+          symbol: alertModalSymbol,
+          target: newAlertTarget,
+          direction: newAlertDirection,
+          note: newAlertNote
+        })
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const saved: PriceAlert = await res.json();
+      setPriceAlerts(pa => [...pa, saved]);
+      setNewAlertTarget(0);
+      setNewAlertNote('');
+    } catch (e) {
+      console.error('❌ create alert failed', e);
+    }
+  };
+
+  const deletePriceAlert = async (id:string) => {
+    try {
+      const token = await getIdToken(); if (!token) throw new Error('Not authenticated');
+      const res = await fetch('/api/alerts/priceAlerts', {
+        method: 'DELETE',
+        headers: {
+          'Content-Type':'application/json',
+          Authorization:`Bearer ${token}`
+        },
+        body: JSON.stringify({ id })
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setPriceAlerts(pa => pa.filter(a => a.id !== id));
+    } catch (e) {
+      console.error('❌ delete alert failed', e);
+    }
+  };
+
+  // ------------------------------
+  // Alert Modal JSX
+  // ------------------------------
+  const renderAlertModal = () => {
+    if (!alertModalSymbol) return null;
+    const symbolAlerts = priceAlerts.filter(a => a.symbol === alertModalSymbol);
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50">
+        <div className="bg-gray-800 p-6 rounded-lg space-y-4 max-w-sm w-full">
+          <h3 className="text-lg">🔔 Alerts for {alertModalSymbol}</h3>
+          {symbolAlerts.map(a => (
+            <div key={a.id} className="flex justify-between items-center">
+              <span>
+                {a.direction} {a.target.toFixed(2)} {a.note && `– ${a.note}`}
+                {a.triggered && <span className="text-green-400"> (✔️)</span>}
+              </span>
+              <button onClick={() => deletePriceAlert(a.id)} className="text-red-400 hover:text-red-200">✖️</button>
+            </div>
+          ))}
+          <div className="flex flex-col gap-2">
+            <input
+              type="number"
+              className="px-2 py-1 rounded bg-gray-700 text-white"
+              value={newAlertTarget}
+              onChange={e => setNewAlertTarget(parseFloat(e.target.value))}
+              placeholder="Price"
+            />
+            <select
+              className="px-2 py-1 rounded bg-gray-700 text-white"
+              value={newAlertDirection}
+              onChange={e => setNewAlertDirection(e.target.value as any)}
+            >
+              <option value="above">Above</option>
+              <option value="below">Below</option>
+            </select>
             <input
               type="text"
-              placeholder="Add Symbol"
-              value={newSymbolText}
-              onChange={(e) => setNewSymbolText(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') handleAddSymbol(); }}
-              className={`text-sm px-3 py-2 border rounded-lg ${theme === 'dark' ? 'bg-gray-800 text-white border-gray-600' : 'bg-white text-gray-800 border-gray-300'}`}
-              style={{ width: '120px' }}
+              className="px-2 py-1 rounded bg-gray-700 text-white"
+              value={newAlertNote}
+              onChange={e => setNewAlertNote(e.target.value)}
+              placeholder="Note (optional)"
             />
-            <button onClick={handleAddSymbol} className="text-sm px-3 py-2 bg-green-600 text-white rounded shadow hover:scale-105 transition transform">
-              Add
-            </button>
+            <button onClick={createPriceAlert} className={btnClasses}>Add Alert</button>
           </div>
+          <button onClick={() => setAlertModalSymbol(null)} className="underline text-sm">Close</button>
         </div>
-
-        {/* Main Content: Left Table and Right Detail Panel */}
-        <div className="grid grid-cols-2 gap-6">
-          {/* LEFT: Symbol Table */}
-          <div className="bg-opacity-70 rounded-xl shadow-2xl backdrop-blur-lg p-4 overflow-x-auto">
-            <h2 className="text-base font-bold mb-3">{currentWatchlist.name}</h2>
-            <table className="w-full border-collapse text-base">
-              <thead className="bg-gray-200 dark:bg-gray-700">
-                <tr>
-                  <th className="px-3 py-2">Symbol</th>
-                  <th className="px-3 py-2">% Ch</th>
-                  <th className="px-3 py-2">Last</th>
-                </tr>
-              </thead>
-              <tbody>
-                {currentWatchlist.symbols.map(sym => (
-                  <tr
-                    key={sym.id}
-                    className="cursor-pointer transition duration-200 hover:bg-gradient-to-r hover:from-blue-500 hover:via-cyan-500 hover:to-purple-500 hover:text-white"
-                    onClick={() => {
-                      setSelectedSymbolId(sym.id);
-                      console.log('[WatchlistPage] Selected symbol:', sym.symbol);
-                    }}
-                  >
-                    <td className="px-3 py-2 font-medium">{sym.symbol}</td>
-                    <td className="px-3 py-2">{sym.percentChange}</td>
-                    <td className="px-3 py-2">{sym.lastPrice}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          {/* RIGHT: Detail Panel for Selected Symbol */}
-          <div className="bg-opacity-70 rounded-xl shadow-2xl backdrop-blur-lg p-4 overflow-x-auto">
-            {selectedSymbol ? (
-              <div className="space-y-6">
-                {/* 1) Press Release Window */}
-                <div className="border-b pb-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <h3 className="font-semibold text-lg">Press Release</h3>
-                    <div className="flex items-center space-x-3">
-                      <FaFlag size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'flag')} />
-                      <FaSave size={25} className="cursor-pointer text-green-500 hover:text-green-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'save')} />
-                      <FaTag size={25} className="cursor-pointer text-purple-500 hover:text-purple-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'tag')} />
-                      <FaTrash size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => handleDeleteSymbol(selectedSymbol.id)} />
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Name</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Name" value={selectedSymbol.pressName} onChange={e => updateSymbolField(selectedSymbol.id, 'pressName', e.target.value)} />
-                    </div>
-                    <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Account</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Account" value={selectedSymbol.pressAccount} onChange={e => updateSymbolField(selectedSymbol.id, 'pressAccount', e.target.value)} />
-                    </div>
-                    <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Date &amp; Time</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="MM/DD/YYYY HH:MM" value={selectedSymbol.pressDateTime} onChange={e => updateSymbolField(selectedSymbol.id, 'pressDateTime', e.target.value)} />
-                    </div>
-                    <div className="col-span-2">
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Headline</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Headline linked to URL" value={selectedSymbol.pressHeadline} onChange={e => updateSymbolField(selectedSymbol.id, 'pressHeadline', e.target.value)} />
-                    </div>
-                  </div>
-                </div>
-
-                {/* 2) Tweets Window */}
-                <div className="border-b pb-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <h3 className="font-semibold text-lg">Tweets</h3>
-                    <div className="flex items-center space-x-3">
-                      <FaFlag size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'flag')} />
-                      <FaSave size={25} className="cursor-pointer text-green-500 hover:text-green-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'save')} />
-                      <FaTag size={25} className="cursor-pointer text-purple-500 hover:text-purple-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'tag')} />
-                      <FaTrash size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => handleDeleteSymbol(selectedSymbol.id)} />
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Name</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Name" value={selectedSymbol.tweetName} onChange={e => updateSymbolField(selectedSymbol.id, 'tweetName', e.target.value)} />
-                    </div>
-                    <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Account</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Account" value={selectedSymbol.tweetAccount} onChange={e => updateSymbolField(selectedSymbol.id, 'tweetAccount', e.target.value)} />
-                    </div>
-                    <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Date &amp; Time</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="MM/DD/YYYY HH:MM" value={selectedSymbol.tweetDateTime} onChange={e => updateSymbolField(selectedSymbol.id, 'tweetDateTime', e.target.value)} />
-                    </div>
-                    <div className="col-span-2">
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Tweet Content</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Tweet content" value={selectedSymbol.tweetContent} onChange={e => updateSymbolField(selectedSymbol.id, 'tweetContent', e.target.value)} />
-                    </div>
-                  </div>
-                </div>
-
-                {/* 3) Trade Exchange Window */}
-                <div className="border-b pb-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <h3 className="font-semibold text-lg">Trade Exchange Template</h3>
-                    <div className="flex items-center space-x-3">
-                      <FaFlag size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'flag')} />
-                      <FaSave size={25} className="cursor-pointer text-green-500 hover:text-green-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'save')} />
-                      <FaTag size={25} className="cursor-pointer text-purple-500 hover:text-purple-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'tag')} />
-                      <FaTrash size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => handleDeleteSymbol(selectedSymbol.id)} />
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-1 gap-3">
-                    <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Date &amp; Time</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="MM/DD/YYYY HH:MM" value={selectedSymbol.tradeDateTime} onChange={e => updateSymbolField(selectedSymbol.id, 'tradeDateTime', e.target.value)} />
-                    </div>
-                    <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Trade Exchange Message</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Trade Exchange message" value={selectedSymbol.tradeMessage} onChange={e => updateSymbolField(selectedSymbol.id, 'tradeMessage', e.target.value)} />
-                    </div>
-                  </div>
-                </div>
-
-                {/* 4) Filings Window */}
-                <div className="border-b pb-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <h3 className="font-semibold text-lg">Filings Template</h3>
-                    <div className="flex items-center space-x-3">
-                      <FaFlag size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'flag')} />
-                      <FaSave size={25} className="cursor-pointer text-green-500 hover:text-green-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'save')} />
-                      <FaTag size={25} className="cursor-pointer text-purple-500 hover:text-purple-700" onClick={() => toggleSymbolField(selectedSymbol.id, 'tag')} />
-                      <FaTrash size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => handleDeleteSymbol(selectedSymbol.id)} />
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-1 gap-3">
-                    <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Date &amp; Time</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="MM/DD/YYYY HH:MM" value={selectedSymbol.filingsDateTime} onChange={e => updateSymbolField(selectedSymbol.id, 'filingsDateTime', e.target.value)} />
-                    </div>
-                    <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">Form</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Filing Form" value={selectedSymbol.filingsForm} onChange={e => updateSymbolField(selectedSymbol.id, 'filingsForm', e.target.value)} />
-                    </div>
-                    <div>
-                      <label className="block text-sm text-gray-600 dark:text-gray-300">User Saved Notes</label>
-                      <input type="text" className="w-full border rounded px-2 py-2 dark:bg-gray-800" placeholder="Let user type here" value={selectedSymbol.filingsNotes} onChange={e => updateSymbolField(selectedSymbol.id, 'filingsNotes', e.target.value)} />
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="text-base text-gray-500 dark:text-gray-300">No symbol selected.</div>
-            )}
-          </div>
-        </div>
-
-        {/* VERY BOTTOM: Press Release Template spanning full width */}
-        <div className="mt-8 bg-opacity-70 rounded-xl shadow-2xl backdrop-blur-lg p-4 w-full">
-          <h2 className="text-lg font-bold mb-3">Press Release Template (Bottom)</h2>
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse text-base">
-              <thead className="bg-gray-200 dark:bg-gray-700">
-                <tr>
-                  <th className="px-3 py-2 text-left">Symbol</th>
-                  <th className="px-3 py-2 text-left">Company Title</th>
-                  <th className="px-3 py-2 text-left">Time Stamp</th>
-                  <th className="px-3 py-2 text-left">Headline</th>
-                  <th className="px-3 py-2 text-left">Flag</th>
-                  <th className="px-3 py-2 text-left">Save</th>
-                  <th className="px-3 py-2 text-left">Tag</th>
-                  <th className="px-3 py-2 text-left">Del</th>
-                </tr>
-              </thead>
-              <tbody>
-                {bottomPressReleases.map(pr => (
-                  <tr key={pr.id} className="border-b transition duration-200 hover:bg-gradient-to-r hover:from-blue-500 hover:via-cyan-500 hover:to-purple-500 hover:text-white">
-                    <td className="px-3 py-2">{pr.symbol}</td>
-                    <td className="px-3 py-2">{pr.companyTitle}</td>
-                    <td className="px-3 py-2">{pr.timeStamp}</td>
-                    <td className="px-3 py-2">{pr.headline}</td>
-                    <td className="px-3 py-2">
-                      <FaFlag size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => toggleBottomPRField(pr.id, 'flag')} />
-                    </td>
-                    <td className="px-3 py-2">
-                      <FaSave size={25} className="cursor-pointer text-green-500 hover:text-green-700" onClick={() => toggleBottomPRField(pr.id, 'save')} />
-                    </td>
-                    <td className="px-3 py-2">
-                      <FaTag size={25} className="cursor-pointer text-purple-500 hover:text-purple-700" onClick={() => toggleBottomPRField(pr.id, 'tag')} />
-                    </td>
-                    <td className="px-3 py-2">
-                      <FaTrash size={25} className="cursor-pointer text-red-500 hover:text-red-700" onClick={() => handleDeleteBottomPR(pr.id)} />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
       </div>
-    </div>
-  );
-}
+    );
+  };
+
+  // ------------------------------
+  // Pop‑outs & page JSX
+  // ------------------------------
+  const openTradeExchangePopup = () => {
+    const w = window.open('', 'TradeExchangeWindow', 'width=400,height=600');
+    if (!w) return;
+    const html = `
+      <html><head><title>TradeExchange</title>
+        <style>body{margin:0;padding:20px;background:#111;color:#eee;font-family:sans-serif}
+        .card{background:#222;border:1px solid #3f3;padding:10px;margin-bottom:10px;border-radius:6px}
+        .meta{font-size:0.8rem;color:#0f0;margin-bottom:4px}.content{color:#ddd}</style>
+      </head><body>
+        <h2>📣 TradeExchange Posts</h2>
+        ${tradePosts.map(p => `
+          <div class="card">
+            <div class="meta">${new Date(p.save_time_utc).toLocaleString()} – ${p.source}</div>
+            <div class="content">${p.content}</div>
+          </div>
+        `).join('')}
+      </body></html>`;
+    w.document.write(html);
+    w.document.close();
+  };
+
+  const openFilingsPopup = () => {
+    const w = window.open('', 'FilingsWindow', 'width=400,height=600');
+    if (!w) return;
+    const html = `
+      <html><head><title>Filings</title>
+        <style>body{margin:0;padding:20px;background:#111;color:#eee;font-family:sans-serif}
+        .card{background:#222;border:1px solid #fa0;padding:10px;margin-bottom:10px;border-radius:6px}
+        .meta{font-size:0.8rem;color:#fa0;margin-bottom:4px}.content{color:#ddd}</style>
+      </head><body>
+        <h2>📄 Recent Filings</h2>
+        ${filings.map(f => `
+          <div class="card">
+            <div class="meta">${new Date(f.save_time).toLocaleString()} – ${f.form}</div>
+            <div class="content">${f.symbol}</div>
+            <div><a href="${f.url}" target="_blank" style="color:#6cf;">View Document</a></div>
+          </div>
+        `).join('')}
+      </body></html>`;
+    w.document.write(html);
+    w.document.close();
+  };
+
+  return (
+    <div className="bg-black text-gray-200 min-h-screen relative">
+      {/* Toast Notifications */}
+      <div className="fixed top-4 right-4 space-y-2 z-50">
+        {notifications.map((msg,i) => (
+          <div key={i} className="bg-yellow-500 text-black px-4 py-2 rounded shadow flex justify-between items-center">
+            <span>{msg}</span>
+            <button onClick={() => setNotifications(n => n.filter((_,idx) => idx!==i))} className="ml-2 font-bold">×</button>
+          </div>
+        ))}
+      </div>
+
+      {/* Background Gradient */}
+      <div className="absolute inset-0 bg-gradient-to-br from-gray-900 via-gray-800 to-black" style={{ backgroundAttachment:'fixed' }}/>
+
+      <div className="relative z-10 max-w-7xl mx-auto p-6 space-y-8">
+        {/* Logo */}
+        <div className="flex justify-center">
+          <LogoImage style={{ width:200, height:120 }}/>
+        </div>
+
+        {/* Top Controls */}
+        <div className="flex flex-wrap gap-4 items-center justify-center">
+          <select
+            value={selectedWatchlistIndex}
+            onChange={e => { setSelectedWatchlistIndex(+e.target.value); setTweetFilter('*'); }}
+            className="px-3 py-2 bg-gray-800 border border-gray-600 rounded"
+          >
+            {watchlists.map((w,i) => <option key={i} value={i}>{w.name}</option>)}
+          </select>
+
+          <input
+            className="px-3 py-2 bg-gray-800 border border-gray-600 rounded"
+            placeholder="New Watchlist"
+            value={newWatchlistName}
+            onChange={e => setNewWatchlistName(e.target.value)}
+          />
+          <button onClick={addWatchlist} className={btnClasses}>Add Watchlist</button>
+
+          <input
+            className="px-3 py-2 bg-gray-800 border border-gray-600 rounded"
+            placeholder="Add Symbol"
+            value={newSymbolText}
+            onChange={e => setNewSymbolText(e.target.value)}
+            onKeyDown={e => e.key==='Enter' && addSymbol()}
+          />
+          <button onClick={addSymbol} className={btnClasses}>Add Symbol</button>
+
+          <button
+            onClick={() => setTweetFilter(f => f==='*'?null:'*')}
+            className={btnClasses}
+          >
+            {tweetFilter==='*' ? 'Hide All Tweets' : 'Show All Tweets'}
+          </button>
+
+          <button onClick={saveToFirebase} className={btnClasses}>💾 Save</button>
+          <button onClick={openTradeExchangePopup} className={btnClasses}>🪟 Pop Out TradeExchange</button>
+          <button onClick={openFilingsPopup} className={btnClasses}>🪟 Pop Out Filings</button>
+        </div>
+
+        {/* Quotes Table */}
+        <div className="bg-gray-900 rounded-lg shadow-xl p-4 overflow-x-auto">
+          <table className="w-full text-sm border-collapse">
+            <thead className="bg-gray-800 text-gray-300">
+              <tr>
+                <th className="px-4 py-2 border border-gray-700">Symbol</th>
+                <th className="px-4 py-2 border border-gray-700">% Change</th>
+                <th className="px-4 py-2 border border-gray-700">Last Price</th>
+                <th className="px-4 py-2 border border-gray-700">Tweets</th>
+                <th className="px-4 py-2 border border-gray-700">Alerts</th>
+                <th className="px-4 py-2 border border-gray-700">Delete</th>
+              </tr>
+            </thead>
+            <tbody>
+              {current.symbols.map(s => (
+                <tr key={s.id} className="hover:bg-gradient-to-r hover:from-blue-500 hover:via-cyan-500 hover:to-purple-500 hover:text-white transition transform">
+                  <td className="px-4 py-
