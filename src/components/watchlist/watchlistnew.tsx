@@ -89,18 +89,20 @@ export default function WatchlistPage() {
 
   // 6) Price Alerts + Toasts
   const [priceAlerts, setPriceAlerts] = useState<PriceAlert[]>([]);
-  const [alertModalSymbol, setAlertModalSymbol] = useState<string|null>(null);
+  const priceAlertsRef = useRef<PriceAlert[]>([]);
+  const [alertModalSymbol, setAlertModalSymbol] = useState<string | null>(null);
   const [newAlertTarget, setNewAlertTarget] = useState<number>(0);
-  const [newAlertDirection, setNewAlertDirection] = useState<'above'|'below'>('above');
+  const [newAlertDirection, setNewAlertDirection] = useState<'above' | 'below'>('above');
   const [newAlertNote, setNewAlertNote] = useState<string>('');
   const [notifications, setNotifications] = useState<string[]>([]);
-  const priceAlertsRef = useRef<PriceAlert[]>([]);
-  useEffect(() => { priceAlertsRef.current = priceAlerts; }, [priceAlerts]);
 
-  const srUrl = 'https://tradecompanion.azurewebsites.net/api';
-  const current = watchlists[selectedWatchlistIndex] || { name:'', symbols:[] };
+  useEffect(() => {
+    priceAlertsRef.current = priceAlerts;
+  }, [priceAlerts]);
 
-  // Base button styles
+  const srUrl = 'https://tradecompanion3.azurewebsites.net/api';
+  const current = watchlists[selectedWatchlistIndex] || { name: '', symbols: [] };
+
   const btnClasses = `
     bg-gradient-to-r from-blue-600/20 via-cyan-300/20 to-purple-600/20
     border border-gray-600 rounded px-4 py-2
@@ -109,13 +111,12 @@ export default function WatchlistPage() {
     hover:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/50
   `;
 
-  // Helper: Firebase ID token
-  async function getIdToken(): Promise<string|null> {
+  async function getIdToken(): Promise<string | null> {
     const user = getAuth().currentUser;
     return user ? await user.getIdToken() : null;
   }
 
-  // Load price alerts from backend
+  // Load price alerts
   useEffect(() => {
     (async () => {
       const token = await getIdToken();
@@ -128,141 +129,139 @@ export default function WatchlistPage() {
     })();
   }, []);
 
-  // SignalR: Quotes & Filings
+  // SignalR: negotiate + connect
   useEffect(() => {
-    const conn = new signalR.HubConnectionBuilder()
-      .withUrl(srUrl, { transport: signalR.HttpTransportType.WebSockets, withCredentials:false })
-      .withAutomaticReconnect()
-      .configureLogging(signalR.LogLevel.Warning)
-      .build();
+    let conn: signalR.HubConnection | null = null;
+    (async () => {
+      try {
+        const res = await fetch(`${srUrl}/negotiate`, { method: 'POST' });
+        if (!res.ok) throw new Error('Negotiate failed: ' + res.statusText);
+        const payload = await res.json();
+        const url = (payload as any).Url;
+        const token = (payload as any).AccessToken;
+        if (!url) throw new Error('Missing Url in negotiate response');
 
-    conn.on('BroadcastQuotes', (data: Quote[]) => {
-      setWatchlists(prev =>
-        prev.map(wl => ({
-          ...wl,
-          symbols: wl.symbols.map(s => {
-            const q = data.find(q => q.s === s.symbol);
-            if (!q) return s;
-            const last = q.l;
-            const open = (q.o ?? parseFloat(s.lastPrice)) || 0;
-            return {
-              ...s,
-              lastPrice: last.toFixed(2),
-              percentChange: open > 0
-                ? `${(((last - open)/open)*100).toFixed(2)}%`
-                : s.percentChange
-            };
+        conn = new signalR.HubConnectionBuilder()
+          .withUrl(url, {
+            accessTokenFactory: () => token,
+            transport:
+              signalR.HttpTransportType.WebSockets |
+              signalR.HttpTransportType.ServerSentEvents |
+              signalR.HttpTransportType.LongPolling
           })
-        }))
-      );
-      // check price alerts
-      data.forEach(q =>
-        priceAlertsRef.current.forEach(alert => {
-          if (!alert.triggered && alert.symbol === q.s) {
-            if (
-              (alert.direction === 'above' && q.l >= alert.target) ||
-              (alert.direction === 'below' && q.l <= alert.target)
-            ) {
-              setPriceAlerts(pa =>
-                pa.map(a => a.id === alert.id ? { ...a, triggered: true } : a)
-              );
-              setNotifications(n => [
-                ...n,
-                `🔔 ${alert.symbol} is ${alert.direction} ${alert.target.toFixed(2)}`
-              ]);
-            }
-          }
-        })
-      );
-    });
+          .withAutomaticReconnect()
+          .configureLogging(signalR.LogLevel.Warning)
+          .build();
 
-    conn.on('BroadcastFiling', (f: Filing) => {
-      setRawFilings(prev => [f, ...prev]);
-    });
+        // debug connection lifecycle
+        conn.onreconnecting(error => console.warn('SignalR reconnecting', error));
+        conn.onreconnected(connectionId => console.log('SignalR reconnected, connectionId:', connectionId));
+        conn.onclose(error => console.error('SignalR connection closed', error));
 
-    conn.start().then(() => setConnection(conn)).catch(console.error);
-    return () => void conn.stop();
+        conn.on('BroadcastQuotes', (data: Quote[]) => {
+          console.log('=== BroadcastQuotes received ===', data);
+          setWatchlists(prev => prev.map(wl => ({
+            ...wl,
+            symbols: wl.symbols.map(s => {
+              const q = data.find(q => q.s === s.symbol);
+              if (!q) return s;
+              const last = q.l;
+              const open = (q.o ?? parseFloat(s.lastPrice)) || 0;
+              return {
+                ...s,
+                lastPrice: last.toFixed(2),
+                percentChange: open > 0
+                  ? `${(((last - open) / open) * 100).toFixed(2)}%`
+                  : s.percentChange
+              };
+            })
+          })));
+          data.forEach(q =>
+            priceAlertsRef.current.forEach(alert => {
+              if (!alert.triggered && alert.symbol === q.s) {
+                if ((alert.direction === 'above' && q.l >= alert.target) ||
+                    (alert.direction === 'below' && q.l <= alert.target)) {
+                  setPriceAlerts(pa => pa.map(a => a.id === alert.id ? { ...a, triggered: true } : a));
+                  setNotifications(n => [...n, `🔔 ${alert.symbol} is ${alert.direction} ${alert.target.toFixed(2)}`]);
+                }
+              }
+            })
+          );
+        });
+
+        conn.on('BroadcastFiling', (f: Filing) => {
+          setRawFilings(prev => [f, ...prev]);
+        });
+
+        await conn.start();
+        console.log('SignalR connected');
+        setConnection(conn);
+      } catch (err) {
+        console.error('SignalR connection error:', err);
+      }
+    })();
+    return () => { if (conn) conn.stop().catch(() => {}); };
   }, []);
 
-  // Auto‑subscribe symbols
+  // Auto-subscribe via SignalR
   useEffect(() => {
     if (!connection) return;
     current.symbols.forEach(s => {
-      connection.invoke('Subscribe', s.symbol).catch(console.error);
+      console.log('Auto subscribing to', s.symbol);
+      connection.invoke('SubL1', s.symbol)
+        .then(() => console.log(`Subscribed to ${s.symbol}`))
+        .catch(err => console.error('Subscribe invocation error for', s.symbol, err));
     });
   }, [connection, current.symbols]);
 
-  const subscribe = async (sym: string) => {
-    if (!connection?.connectionId) return;
-    await fetch(`${srUrl}/SubL1?symbol=${sym}&connectionId=${connection.connectionId}`);
+  // Watchlist CRUD & methods
+  const addWatchlist = () => {
+    const nm = newWatchlistName.trim(); if (!nm) return;
+    setWatchlists(wl => [...wl, { name: nm, symbols: [] }]);
+    setSelectedWatchlistIndex(watchlists.length);
+    setNewWatchlistName('');
+  };
+
+  const addSymbol = () => {
+    const txt = newSymbolText.trim().toUpperCase(); if (!txt) return;
+    const id = current.symbols.length ? current.symbols[current.symbols.length - 1].id + 1 : 1;
+    const sym = { id, symbol: txt, percentChange: '+0.00%', lastPrice: '0.00' };
+    setWatchlists(prev => prev.map((w, i) => i === selectedWatchlistIndex ? { ...w, symbols: [...w.symbols, sym] } : w));
+    setNewSymbolText('');
+    if (connection) {
+      console.log('Manual subscribe for', txt);
+      connection.invoke('SubL1', txt)
+        .then(() => console.log(`Manual subscribed to ${txt}`))
+        .catch(err => console.error('Manual subscribe error for', txt, err));
+    }
+  };
+
+  const deleteSymbol = (symbolId: number) => {
+    setWatchlists(prev => prev.map((w, i) => i === selectedWatchlistIndex ? { ...w, symbols: w.symbols.filter(s => s.id !== symbolId) } : w));
+    setTweetFilter('*');
+  };
+
+  const saveToFirebase = async () => {
+    const user = getAuth().currentUser; if (!user) { alert('Please log in'); return; }
+    const res = await fetch('/api/watchlist/savewatchlist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid: user.uid, watchlists }) });
+    alert(res.ok ? '✅ Saved' : '❌ Save failed');
   };
 
   // Load watchlists
   useEffect(() => {
     (async () => {
-      const auth = getAuth(), user = auth.currentUser;
-      if (!user) return;
-      const res = await fetch('/api/watchlist/loadwatchlist', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ uid: user.uid })
-      });
+      const user = getAuth().currentUser; if (!user) return;
+      const res = await fetch('/api/watchlist/loadwatchlist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uid: user.uid }) });
       if (!res.ok) return;
-      const { watchlists } = await res.json();
-      setWatchlists(watchlists.length
-        ? watchlists
-        : [{ name:'Watchlist 1', symbols:[] }]
-      );
+      const data = await res.json();
+      setWatchlists(data.watchlists.length ? data.watchlists : [{ name: 'Watchlist 1', symbols: [] }]);
     })();
   }, []);
 
-  // CRUD: Watchlists & Symbols
-  const addWatchlist = () => {
-    const nm = newWatchlistName.trim();
-    if (!nm) return;
-    setWatchlists(wl => [...wl, { name: nm, symbols: [] }]);
-    setSelectedWatchlistIndex(watchlists.length);
-    setNewWatchlistName('');
-  };
-  const addSymbol = () => {
-    const txt = newSymbolText.trim().toUpperCase();
-    if (!txt) return;
-    const id = current.symbols.length
-      ? current.symbols[current.symbols.length - 1].id + 1
-      : 1;
-    const sym = { id, symbol: txt, percentChange: '+0.00%', lastPrice: '0.00' };
-    setWatchlists(prev =>
-      prev.map((w,i) =>
-        i === selectedWatchlistIndex
-          ? { ...w, symbols: [...w.symbols, sym] }
-          : w
-      )
-    );
-    setNewSymbolText('');
-    subscribe(txt);
-  };
-  const deleteSymbol = (symbolId: number) => {
-    setWatchlists(prev =>
-      prev.map((w,i) =>
-        i === selectedWatchlistIndex
-          ? { ...w, symbols: w.symbols.filter(s => s.id !== symbolId) }
-          : w
-      )
-    );
-    setTweetFilter('*');
-  };
-  const saveToFirebase = async () => {
-    const auth = getAuth(), user = auth.currentUser;
-    if (!user) { alert('Please log in'); return; }
-    const res = await fetch('/api/watchlist/savewatchlist', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json' },
-      body: JSON.stringify({ uid:user.uid, watchlists })
-    });
-    alert(res.ok ? '✅ Saved' : '❌ Save failed');
-  };
 
-  // Tweets
+
+
+  // Tweets effect
   useEffect(() => {
     if (!current.symbols.length) { setTweetsBySymbol({}); return; }
     (async () => {
@@ -277,23 +276,20 @@ export default function WatchlistPage() {
           .reverse();
       });
       setTweetsBySymbol(bySym);
-      setTweetFilter('*');
-      setExpandedTweets(new Set());
+      setTweetFilter('*'); setExpandedTweets(new Set());
     })();
   }, [current.symbols]);
 
   // TradeExchange
-  useEffect(() => {
-    (async () => {
+  useEffect(() => { (async () => {
       const res = await fetch(`${srUrl}/TradeExchangeGet`);
       if (!res.ok) return;
       setTradePosts(await res.json());
     })();
   }, []);
 
-  // Initial Filings
-  useEffect(() => {
-    (async () => {
+  // Filings
+  useEffect(() => { (async () => {
       const since = new Date(0).toISOString().substring(0,19);
       const res = await fetch(`${srUrl}/Filings?since=${encodeURIComponent(since)}`);
       if (!res.ok) return;
